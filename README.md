@@ -11,6 +11,6 @@ A real-time party game for 2–8 players, each on their own device.
 4. After 8 rounds, the highest score wins.
 
 ## How it works
-A single static page. The host's browser runs the game and is the source of truth; other players connect to it peer-to-peer over WebRTC using [PeerJS](https://peerjs.com) and its free signaling server. No backend to run. If the host closes their tab, the game ends.
+One static page, no backend. The host's browser runs the game and is the referee. Players' browsers talk to it through a public MQTT broker (EMQX) over secure WebSockets, so it works across different networks, phones and VPNs. The room code picks the channel. If the host closes their tab, the game ends.
 
 Add `?local` to the URL to test with two tabs in one browser without any network.

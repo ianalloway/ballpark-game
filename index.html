@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Ballpark</title>
+<script>/* relative assets need a trailing slash on the folder URL */if(!/\/$|\.html$/.test(location.pathname))location.replace(location.pathname+"/"+location.search+location.hash);</script>
 <meta name="description" content="A live party game for 2–8 players: everyone guesses the number, closest guess scores.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -98,7 +99,7 @@ footer{text-align:center;color:var(--chalk-dim);font-size:12px}
 </head>
 <body>
 <main id="app" aria-live="polite"></main>
-<script src="peerjs.min.js"></script>
+<script src="mqtt.min.js"></script>
 <script>
 "use strict";
 /* ---------------- Question bank: stable facts with numeric answers ---------------- */
@@ -140,7 +141,7 @@ const QUESTIONS = [
   {q:"How many strings does a violin have?", a:4},
   {q:"How many hours are in a non-leap year?", a:8760},
 ];
-const ROUNDS = 8, ROUND_MS = 35000, MAX_PLAYERS = 8, ID_PREFIX = "ballpark-game-";
+const ROUNDS = 8, ROUND_MS = 35000, MAX_PLAYERS = 8;
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 const LOCAL = new URLSearchParams(location.search).has("local"); // same-browser test mode, no network
 
@@ -155,95 +156,129 @@ function myKey(){ let k; try{ k = sessionStorage.getItem("bp-key"); }catch(e){} 
 function savedName(){ try{ return localStorage.getItem("bp-name")||""; }catch(e){ return ""; } }
 function saveName(n){ try{ localStorage.setItem("bp-name",n); }catch(e){} }
 
-/* ---------------- transport: PeerJS (real) or BroadcastChannel (?local) ---------------- */
-function hostTransport(code, onMsg, onLeave){
-  return new Promise((resolve, reject) => {
-    if (LOCAL){
-      const ch = new BroadcastChannel(ID_PREFIX+code);
-      ch.onmessage = e => { const m=e.data; if(m.to!=="host") return; if(m.bye) onLeave(m.from); else onMsg(m.from, m.data); };
-      return resolve({ send:(to,d)=>ch.postMessage({to,data:d}), close:()=>ch.close() });
-    }
-    const peer = new Peer(ID_PREFIX+code.toLowerCase());
-    const conns = new Map();
-    peer.on("open", () => resolve({
-      send:(to,d)=>{ const c=conns.get(to); if(c&&c.open) c.send(d); },
-      close:()=>peer.destroy()
-    }));
-    peer.on("connection", conn => {
-      conns.set(conn.peer, conn);
-      conn.on("data", d => onMsg(conn.peer, d));
-      conn.on("close", () => { conns.delete(conn.peer); onLeave(conn.peer); });
-      conn.on("error", () => {});
-    });
-    peer.on("error", err => reject(err));
-    peer.on("disconnected", () => { try{ peer.reconnect(); }catch(e){} });
-  });
+/* ---------------- transport: MQTT relay over secure WebSockets (real) or BroadcastChannel (?local) ----------------
+   Topics under ballpark-ia/v1/<CODE>/
+     alive  retained, the host's id while the room is open ("" once it closes; also the host's last will)
+     state  retained, the full public game state, published by the host on every change
+     up     player -> host messages, each tagged with the sender's id (a player's last will is a "bye")
+     dm/<id> host -> one player (only "room full")                                                     */
+const BROKER = "wss://broker.emqx.io:8084/mqtt";
+const topic = (code, t) => `ballpark-ia/v1/${code}/${t}`;
+function mq(will){
+  return mqtt.connect(BROKER, {clientId:"bp_"+Math.random().toString(36).slice(2,12), clean:true, keepalive:15,
+    reconnectPeriod:2000, connectTimeout:10000, will});
 }
-function clientTransport(code, onMsg, onClose){
-  return new Promise((resolve, reject) => {
-    if (LOCAL){
-      const me = "c"+Math.random().toString(36).slice(2,8);
-      const ch = new BroadcastChannel(ID_PREFIX+code);
-      ch.onmessage = e => { const m=e.data; if(m.to===me||m.to==="*") onMsg(m.data); };
-      addEventListener("beforeunload", () => ch.postMessage({to:"host",from:me,bye:true}));
-      return resolve({ send:d=>ch.postMessage({to:"host",from:me,data:d}) });
-    }
-    const peer = new Peer();
-    let opened = false;
-    const timer = setTimeout(() => { if(!opened){ peer.destroy(); reject({type:"timeout"}); } }, 15000);
-    peer.on("open", () => {
-      const conn = peer.connect(ID_PREFIX+code.toLowerCase(), {reliable:true});
-      conn.on("open", () => { opened=true; clearTimeout(timer); resolve({ send:d=>conn.open&&conn.send(d) }); });
-      conn.on("data", onMsg);
-      conn.on("close", () => { if(opened) onClose(); });
-    });
-    peer.on("error", err => { clearTimeout(timer); if(!opened) reject(err); else if (err.type!=="peer-unavailable") onClose(); });
+function connected(c){
+  return new Promise((res, rej) => { const t=setTimeout(()=>rej({type:"timeout"}),12000); c.once("connect",()=>{clearTimeout(t);res();}); });
+}
+const enc = o => JSON.stringify(o);
+const dec = b => { try{ const s=b.toString(); return s?JSON.parse(s):null; }catch(e){ return null; } };
+
+/* host: openHost(code, onUp) -> {state(s), dm(id,d), close()} ; rejects {type:"taken"} if the code is in use */
+async function openHost(code, onUp){
+  if (LOCAL){
+    const ch = new BroadcastChannel("bp-"+code);
+    ch.onmessage = e => { const m=e.data; if(m.k==="up") onUp(m.d); else if(m.k==="hello" && last) ch.postMessage({k:"state",d:last}); };
+    let last=null;
+    return { state:s=>{last=s; ch.postMessage({k:"state",d:s});}, dm:(id,d)=>ch.postMessage({k:"dm",id,d}),
+             close:()=>{ ch.postMessage({k:"gone"}); ch.close(); } };
+  }
+  const c = mq({topic:topic(code,"alive"), payload:"", qos:1, retain:true});
+  await connected(c);
+  // is this code already taken by a live room?
+  const taken = await new Promise(res => {
+    const t = setTimeout(()=>res(false), 1500);
+    c.on("message", (tp, b) => { if(tp===topic(code,"alive") && b.length){ clearTimeout(t); res(true); } });
+    c.subscribe(topic(code,"alive"), {qos:1});
   });
+  c.removeAllListeners("message"); c.unsubscribe(topic(code,"alive"));
+  if (taken){ c.end(true); throw {type:"taken"}; }
+  let last = null;
+  const announce = () => { c.publish(topic(code,"alive"), ME, {qos:1, retain:true}); if(last) c.publish(topic(code,"state"), enc(last), {qos:1, retain:true}); };
+  c.subscribe(topic(code,"up"), {qos:1});
+  c.on("message", (tp, b) => { if(tp===topic(code,"up")){ const m=dec(b); if(m) onUp(m); } });
+  c.on("connect", announce);            // re-assert the room after any reconnect
+  announce();
+  return {
+    state: s => { last=s; c.publish(topic(code,"state"), enc(s), {qos:1, retain:true}); },
+    dm: (id,d) => c.publish(topic(code,"dm/"+id), enc(d), {qos:1}),
+    close: () => { c.publish(topic(code,"alive"), "", {qos:1, retain:true}); c.publish(topic(code,"state"), "", {qos:1, retain:true}); setTimeout(()=>c.end(),300); }
+  };
+}
+
+/* player: openClient(code, handlers) -> {send(d)} ; rejects {type:"not-found"} when no live room has that code */
+async function openClient(code, h){
+  if (LOCAL){
+    const ch = new BroadcastChannel("bp-"+code);
+    ch.onmessage = e => { const m=e.data; if(m.k==="state") h.state(m.d); else if(m.k==="dm"&&m.id===ME) h.dm(m.d); else if(m.k==="gone") h.gone(); };
+    addEventListener("beforeunload", () => ch.postMessage({k:"up",d:{t:"bye",from:ME}}));
+    const api = { send:d=>ch.postMessage({k:"up",d:{...d,from:ME}}) };
+    ch.postMessage({k:"hello"});
+    return api;
+  }
+  const c = mq({topic:topic(code,"up"), payload:enc({t:"bye",from:ME}), qos:1, retain:false});
+  await connected(c);
+  let alive = false, goneTimer = null, found;
+  const foundP = new Promise(r => found = r);
+  c.on("message", (tp, b) => {
+    if (tp===topic(code,"alive")){
+      if (b.length){ alive=true; clearTimeout(goneTimer); found(true); }
+      else if (alive){ clearTimeout(goneTimer); goneTimer=setTimeout(h.gone, 8000); } // allow a host reconnect
+    } else if (tp===topic(code,"state")){ const s=dec(b); if(s) h.state(s); }
+    else if (tp===topic(code,"dm/"+ME)){ const d=dec(b); if(d) h.dm(d); }
+  });
+  c.subscribe([topic(code,"alive"), topic(code,"state"), topic(code,"dm/"+ME)], {qos:1});
+  setTimeout(()=>found(false), 4000);
+  if (!(await foundP)){ c.end(true); throw {type:"not-found"}; }
+  const api = { send: d => c.publish(topic(code,"up"), enc({...d, from:ME}), {qos:1}) };
+  c.on("connect", () => h.reconnected && h.reconnected());
+  addEventListener("pagehide", () => api.send({t:"bye"}));
+  return api;
 }
 
 /* ---------------- app state ---------------- */
 const ME = myKey();
 let view = {screen:"home", error:"", joinCode:(location.hash.slice(1)||"").toUpperCase().replace(/[^A-Z]/g,"").slice(0,4)};
 let pub = null;          // public game state from host
-let net = null;          // client transport
+let net = null;          // player connection
 let isHost = false;
-let tick = null, recvAt = 0;
+let tick = null, recvAt = 0, myName = "", joinTimer = null;
 
-/* ---------------- host engine ---------------- */
+/* ---------------- host engine (the host's browser is the referee) ---------------- */
 const Host = {
-  code:null, t:null, s:null, guesses:{}, deck:[], connToKey:new Map(), timer:null,
+  code:null, t:null, s:null, guesses:{}, deck:[], timer:null, seen:{},
   async start(name){
-    for (let tries=0; tries<4; tries++){
+    for (let tries=0; tries<5 && !this.t; tries++){
       const code = randCode();
-      try{
-        this.t = await hostTransport(code, (from,m)=>this.onMsg(from,m), from=>this.onLeave(from));
-        this.code = code; break;
-      }catch(err){ if(err && err.type==="unavailable-id") continue; throw err; }
+      try{ this.t = await openHost(code, m=>this.onUp(m)); this.code = code; }
+      catch(err){ if(!(err && err.type==="taken")) throw err; }
     }
     if(!this.t) throw new Error("no code");
-    this.s = {code:this.code, phase:"lobby", host:ME, players:[{id:ME,name,score:0,online:true,guessed:false,last:0}], round:0, total:ROUNDS, q:null, msLeft:0, reveal:null};
+    this.s = {code:this.code, phase:"lobby", host:ME, players:[{id:ME,name,score:0,online:true,guessed:false,last:0}], round:0, total:ROUNDS, q:null, msLeft:0, reveal:null, v:0};
     isHost = true; this.push();
+    setInterval(()=>this.sweep(), 5000);
+    addEventListener("pagehide", ()=>this.t.close());
   },
-  onMsg(from, m){
+  onUp(m){
     if(!m || typeof m!=="object") return;
+    const key = String(m.from||"").slice(0,16); if(!key || key===ME) return;
+    this.seen[key] = Date.now();
+    const p = this.s.players.find(p=>p.id===key);
     if(m.t==="join"){
-      const key = String(m.key||"").slice(0,16), name = String(m.name||"").trim().slice(0,20) || "Player";
-      if(!key) return;
-      let p = this.s.players.find(p=>p.id===key);
+      const name = String(m.name||"").trim().slice(0,20) || "Player";
       if(!p){
-        if(this.s.players.length>=MAX_PLAYERS){ this.t.send(from,{t:"full"}); return; }
-        p = {id:key,name,score:0,online:true,guessed:false,last:0}; this.s.players.push(p);
+        if(this.s.players.length>=MAX_PLAYERS){ this.t.dm(key,{t:"full"}); return; }
+        this.s.players.push({id:key,name,score:0,online:true,guessed:false,last:0});
       } else { p.online = true; p.name = name; }
-      this.connToKey.set(from,key);
       this.push();
-    } else if(m.t==="guess"){
-      const key = this.connToKey.get(from); if(key) this.guess(key, m.v);
-    }
+    } else if(m.t==="guess"){ this.guess(key, m.v); }
+    else if(m.t==="hb"){ if(p && !p.online){ p.online=true; this.push(); } }
+    else if(m.t==="bye"){ if(p && p.online){ p.online=false; this.push(); this.maybeReveal(); } }
   },
-  onLeave(from){
-    const key = this.connToKey.get(from); this.connToKey.delete(from);
-    const p = key && this.s.players.find(p=>p.id===key);
-    if(p){ p.online=false; this.push(); this.maybeReveal(); }
+  sweep(){ // players send a heartbeat every 5s; 20s of silence marks them offline
+    let changed=false; const now=Date.now();
+    this.s.players.forEach(p=>{ if(p.id!==ME && p.online && now-(this.seen[p.id]||0)>20000){ p.online=false; changed=true; } });
+    if(changed){ this.push(); this.maybeReveal(); }
   },
   online(){ return this.s.players.filter(p=>p.online); },
   begin(){
@@ -288,15 +323,23 @@ const Host = {
   },
   push(){
     this.s.msLeft = this.s.phase==="question" ? Math.max(0,this.deadline-Date.now()) : 0;
+    this.s.v++;
     const snap = JSON.parse(JSON.stringify(this.s));
-    for (const conn of this.connToKey.keys()) this.t.send(conn,{t:"state",s:snap});
+    this.t.state(snap);
     onState(snap);
   }
 };
 
-/* ---------------- client side ---------------- */
+/* ---------------- player side ---------------- */
 function onState(s){
-  pub = s; recvAt = Date.now(); view.screen = "game"; view.error="";
+  if(pub && s.code===pub.code && s.v<pub.v) return;  // ignore an older retained copy
+  pub = s; recvAt = Date.now(); view.error="";
+  if(!isHost){
+    const inGame = s.players.some(p=>p.id===ME);
+    if(!inGame){ return; }            // keep "Connecting…" until the host has added us
+    clearInterval(joinTimer); joinTimer=null;
+  }
+  view.screen = "game";
   try{ history.replaceState(null,"","#"+s.code); }catch(e){}
   render();
 }
@@ -312,24 +355,28 @@ async function joinGame(){
   const code = ($("#code").value||"").toUpperCase().replace(/[^A-Z]/g,"");
   if(!name){ view.error="Enter your name first."; return render(); }
   if(code.length!==4){ view.error="Room codes are 4 letters."; return render(); }
-  saveName(name); view.joinCode=code; view.screen="connecting"; render();
+  saveName(name); myName=name.slice(0,20); view.joinCode=code; view.screen="connecting"; render();
   try{
-    net = await clientTransport(code, m=>{
-      if(m&&m.t==="state") onState(m.s);
-      else if(m&&m.t==="full"){ view.screen="home"; view.error="That game is full (8 players max)."; render(); }
-    }, ()=>{ view.screen="ended"; render(); });
-    net.send({t:"join", key:ME, name:name.slice(0,20)});
-    setTimeout(()=>{ if(view.screen==="connecting"){ view.screen="home"; view.error="No answer from that room. Check the code."; render(); } }, 8000);
+    net = await openClient(code, {
+      state: onState,
+      dm: m => { if(m.t==="full"){ clearInterval(joinTimer); view.screen="home"; view.error="That game is full (8 players max)."; render(); } },
+      gone: () => { view.screen="ended"; render(); },
+      reconnected: () => net && net.send({t:"join", name:myName})
+    });
+    const hello = () => net.send({t:"join", name:myName});
+    hello(); joinTimer = setInterval(hello, 3000);        // repeat until the host lists us
+    setInterval(()=>net.send({t:"hb"}), 5000);
+    setTimeout(()=>{ if(view.screen==="connecting"){ clearInterval(joinTimer); view.screen="home"; view.error="The host didn't respond. Check the code and try again."; render(); } }, 15000);
   }catch(e){
     view.screen="home";
-    view.error = e && e.type==="peer-unavailable" ? `No game found with code ${code}.` : "Couldn't reach that game. Check the code and try again.";
+    view.error = e && e.type==="not-found" ? `No open game with code ${code}. Check the code with your host.` : "Couldn't reach the game server. Check your connection and try again.";
     render();
   }
 }
 function sendGuess(){
   const v = parseGuess($("#guess").value);
   if(v===null){ $("#gerr").textContent="Type a number, like 1200 or 26.2"; return; }
-  if(isHost) Host.guess(ME, v); else net.send({t:"guess", v});
+  if(isHost) Host.guess(ME, v); else { net.send({t:"guess", v}); $("#gBtn").disabled=true; $("#gBtn").textContent="Sending…"; }
 }
 function copyLink(){
   const link = location.origin+location.pathname+location.search+"#"+pub.code;
