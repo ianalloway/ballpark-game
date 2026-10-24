@@ -15,6 +15,22 @@ One static page, no backend. The host's browser runs the game and is the referee
 
 Add `?local` to the URL to test with two tabs in one browser without any network.
 
+## Local development and checks
+
+No install or build step is needed. Serve the repository over localhost so the
+browser's signing APIs are available:
+
+```sh
+python3 -m http.server 8080
+# Open http://localhost:8080/?local in two separate tabs.
+node --test tests/*.test.mjs
+```
+
+The dependency-free tests cover preserving a typed guess when another player
+updates the room, clearing it on the next round, and rejecting late or duplicate
+guesses. For a manual check, start a round in both tabs, type a partial guess in
+one, and submit from the other. The partial input and cursor should stay put.
+
 ## Security notes
 The relay is public, so anyone who learns a room code can publish to that room. The page treats everything it receives as untrusted: game states are checked against a strict schema and every value is HTML-escaped before it is shown.
 
