@@ -398,6 +398,9 @@ const Host = {
   },
   guess(key, v){
     if(this.s.phase!=="question") return;
+    // A background tab can deliver the timeout late. The deadline, rather
+    // than the timer callback, decides whether a guess still counts.
+    if(Date.now()>=this.deadline){ this.doReveal(); return; }
     const n = typeof v==="number" && Number.isFinite(v) ? v : null;
     const p = this.s.players.find(p=>p.id===key);
     if(n===null || !p || key in this.guesses) return;
@@ -527,6 +530,13 @@ const RULES = `<ol class="rules">
 </ol>`;
 
 function render(){
+  // State broadcasts also arrive when another player guesses or reconnects.
+  // Keep this player's unfinished input and cursor during the same round.
+  const previousGuess=$("#guess");
+  const draft=previousGuess && previousGuess.dataset.round===String(pub?.round)
+    ? {value:previousGuess.value, focused:document.activeElement===previousGuess,
+       start:previousGuess.selectionStart, end:previousGuess.selectionEnd}
+    : null;
   const app=$("#app"); clearInterval(tick);
   const head = `<div class="brand"><h1 class="lit">Ballpark</h1><small>Closest guess wins</small></div>`;
   if(view.screen==="home"){
@@ -587,14 +597,23 @@ function render(){
       <div class="meta"><span class="eyebrow">Round ${esc(s.round)} of ${esc(s.total)}</span><span id="clock" class="clock">35</span></div>
       <p class="q">${esc(s.q)}</p>
       ${locked ? `<div class="waiting"><span class="dot"></span>Guess locked in. Waiting for the others…</div>`
-      : `<label for="guess">Your guess<input id="guess" inputmode="decimal" autocomplete="off" placeholder="Type a number"></label>
+      : `<label for="guess">Your guess<input id="guess" data-round="${s.round}" inputmode="decimal" autocomplete="off" placeholder="Type a number"></label>
          <button id="gBtn">Lock in guess</button><p id="gerr" class="err" role="alert"></p>`}
     </section>
     <section class="panel">${playerList(true)}${isHost?'<button id="revealBtn" class="ghost">Reveal now</button>':''}</section>`;
     const clock=$("#clock");
     const upd=()=>{ const left=Math.max(0,Math.ceil((deadline-Date.now())/1000)); clock.textContent=left; clock.classList.toggle("low",left<=10); };
     upd(); tick=setInterval(upd,250);
-    if(!locked){ $("#gBtn").onclick=sendGuess; const g=$("#guess"); g.onkeydown=e=>{if(e.key==="Enter")sendGuess();}; g.focus(); }
+    if(!locked){
+      $("#gBtn").onclick=sendGuess;
+      const g=$("#guess");
+      g.onkeydown=e=>{if(e.key==="Enter")sendGuess();};
+      if(draft) g.value=draft.value;
+      if(!draft || draft.focused){
+        g.focus({preventScroll:true});
+        if(draft && draft.start!==null && draft.end!==null) g.setSelectionRange(draft.start,draft.end);
+      }
+    }
     if(isHost) $("#revealBtn").onclick=()=>Host.doReveal();
     return;
   }
