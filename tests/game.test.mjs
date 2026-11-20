@@ -90,3 +90,30 @@ test('an on-time guess is accepted once', async () => {
   assert.equal(Host.guesses[getId()], 42);
   assert.equal(Host.s.players[0].guessed, true);
 });
+
+for (const total of [4, 8, 12]) {
+  test(`a ${total}-round match ends on time and retains its length for a rematch`, async () => {
+    const { Host } = await game();
+    Host.s = { phase: 'lobby', round: 0, total: 8, players: [{ online: true }, { online: true }] };
+    const broadcasts = [];
+    Host.push = () => broadcasts.push(Host.s.total);
+    Host.setRounds(99);
+    assert.deepEqual(broadcasts, []);
+    Host.setRounds(total);
+    assert.deepEqual(broadcasts, total === 8 ? [] : [total]);
+    Host.begin();
+    assert.equal(Host.deck.length, total);
+    assert.equal(new Set(Host.deck.map(item => item.q)).size, total);
+    Host.setRounds(total === 4 ? 8 : 4);
+    for (let round = 1; round <= total; round++) {
+      assert.equal(Host.s.phase, 'question');
+      assert.equal(Host.s.round, round);
+      Host.doReveal();
+      Host.next();
+    }
+    assert.equal(Host.s.phase, 'final');
+    Host.begin();
+    assert.equal(Host.s.round, 1);
+    assert.equal(Host.deck.length, total);
+  });
+}
