@@ -44,7 +44,7 @@ p{margin:0}
 .panel{background:var(--board);border:1px solid var(--line);border-radius:14px;padding:20px;display:grid;gap:14px}
 .lit{color:var(--bulb);text-shadow:0 0 18px rgba(255,182,39,.35)}
 label{font-weight:600;font-size:14px;display:grid;gap:6px}
-input{
+input,select{
   font:600 20px var(--body);color:var(--chalk);background:var(--field);
   border:1.5px solid var(--line);border-radius:10px;padding:12px 14px;width:100%;
 }
@@ -56,7 +56,7 @@ button{
 }
 button.ghost{background:transparent;color:var(--chalk);border-color:var(--line)}
 button:disabled{opacity:.4;cursor:not-allowed}
-button:focus-visible,input:focus-visible{outline:3px solid var(--chalk);outline-offset:2px}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--chalk);outline-offset:2px}
 .row{display:flex;gap:10px;flex-wrap:wrap}
 .row>*{flex:1 1 160px}
 .rules{display:grid;gap:8px;padding:0;margin:0;list-style:none;counter-reset:r}
@@ -141,7 +141,7 @@ const QUESTIONS = [
   {q:"How many strings does a violin have?", a:4},
   {q:"How many hours are in a non-leap year?", a:8760},
 ];
-const ROUNDS = 8, ROUND_MS = 35000, MAX_PLAYERS = 8;
+const DEFAULT_ROUNDS = 8, ROUND_OPTIONS = [4, 8, 12], ROUND_MS = 35000, MAX_PLAYERS = 8;
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 const LOCAL = new URLSearchParams(location.search).has("local"); // same-browser test mode, no network
 
@@ -349,7 +349,7 @@ const Host = {
       catch(err){ if(!(err && err.type==="taken")) throw err; }
     }
     if(!this.t) throw new Error("no code");
-    this.s = {code:this.code, phase:"lobby", host:ME, players:[{id:ME,name,score:0,online:true,guessed:false,last:0}], round:0, total:ROUNDS, q:null, msLeft:0, reveal:null, v:0};
+    this.s = {code:this.code, phase:"lobby", host:ME, players:[{id:ME,name,score:0,online:true,guessed:false,last:0}], round:0, total:DEFAULT_ROUNDS, q:null, msLeft:0, reveal:null, v:0};
     isHost = true; this.push();
     setInterval(()=>this.sweep(), 5000);
     addEventListener("pagehide", ()=>this.t.close());
@@ -381,14 +381,19 @@ const Host = {
     if(changed){ this.push(); this.maybeReveal(); }
   },
   online(){ return this.s.players.filter(p=>p.online); },
+  setRounds(total){
+    if(this.s.phase!=="lobby" || !ROUND_OPTIONS.includes(total) || total===this.s.total) return;
+    this.s.total=total;
+    this.push();
+  },
   begin(){
     if(this.online().length<2) return;
-    this.deck = shuffle(QUESTIONS).slice(0,ROUNDS);
+    this.deck = shuffle(QUESTIONS).slice(0,this.s.total);
     this.s.players.forEach(p=>{p.score=0;p.last=0;});
     this.s.round=0; this.next();
   },
   next(){
-    if(this.s.round>=ROUNDS){ this.s.phase="final"; this.s.q=null; this.push(); return; }
+    if(this.s.round>=this.s.total){ this.s.phase="final"; this.s.q=null; this.push(); return; }
     const item = this.deck[this.s.round];
     this.s.round++; this.s.phase="question"; this.s.q=item.q; this.s.reveal=null;
     this.guesses={}; this.s.players.forEach(p=>{p.guessed=false;p.last=0;});
@@ -526,7 +531,7 @@ const RULES = `<ol class="rules">
   <li><span>One player hosts and gets a 4-letter room code. Everyone else joins with that code on their own phone or computer.</span></li>
   <li><span>Each round shows a question whose answer is a number. Type your best guess before the 35-second clock runs out. Guesses stay hidden until everyone is in.</span></li>
   <li><span>Closest guess scores <b>3 points</b>, second closest scores <b>1</b>. Hit the answer exactly for <b>+2 bonus</b>. Ties share the place.</span></li>
-  <li><span>After ${ROUNDS} rounds, the highest score wins.</span></li>
+  <li><span>The host chooses the number of rounds. The highest score after the last round wins.</span></li>
 </ol>`;
 
 function render(){
@@ -582,11 +587,17 @@ function render(){
     <section class="panel">
       <div class="meta"><h2>Players</h2><span class="tag">${n} / ${MAX_PLAYERS}</span></div>
       ${playerList(false)}
+      ${isHost ? `<label for="rounds">Match length<select id="rounds">${ROUND_OPTIONS.map(total=>`<option value="${total}" ${total===s.total?"selected":""}>${total} rounds</option>`).join("")}</select></label>`
+               : `<p class="note">Match length: ${esc(s.total)} rounds</p>`}
       ${isHost ? `<button id="startBtn" ${n<2?"disabled":""}>Start game</button>${n<2?'<p class="note">Waiting for at least one more player to join.</p>':''}`
                : `<div class="waiting"><span class="dot"></span>Waiting for the host to start…</div>`}
     </section>
     <section class="panel"><h2>How to play</h2>${RULES}</section>`;
-    $("#copy").onclick=copyLink; if(isHost) $("#startBtn").onclick=()=>Host.begin();
+    $("#copy").onclick=copyLink;
+    if(isHost){
+      $("#rounds").onchange=e=>Host.setRounds(Number(e.target.value));
+      $("#startBtn").onclick=()=>Host.begin();
+    }
     return;
   }
   if(s.phase==="question"){
