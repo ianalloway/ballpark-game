@@ -38,7 +38,7 @@ async function game() {
     history: { replaceState() {} }, addEventListener() {},
     setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 1; }, clearInterval() {},
   });
-  vm.runInContext(source + '\n;globalThis.api={Host,identity,onState,getId:()=>ME,setRoom:code=>view.joinCode=code};', context);
+  vm.runInContext(source + '\n;globalThis.api={Host,identity,onState,finalStandings,scorecardText,getId:()=>ME,setRoom:code=>view.joinCode=code};', context);
   await context.api.identity;
   return { ...context.api, nodes, document };
 }
@@ -117,3 +117,15 @@ for (const total of [4, 8, 12]) {
     assert.equal(Host.deck.length, total);
   });
 }
+
+test('final scorecards preserve ties, skip tied places, and keep each player on one line', async () => {
+  const { finalStandings, scorecardText } = await game();
+  const players = [
+    { name: 'Kai', score: 2 }, { name: 'Zoë', score: 7 },
+    { name: 'Guest\nTwo', score: 7 }, { name: 'Lee', score: 0 },
+  ];
+  const ranked = finalStandings(players);
+  assert.equal(scorecardText(ranked, 4),
+    'Ballpark final standings\n4 rounds\n\n1. Zoë — 7 pts\n1. Guest Two — 7 pts\n3. Kai — 2 pts\n4. Lee — 0 pts\n');
+  assert.equal(players[0].name, 'Kai', 'rendering the standings leaves the game roster in join order');
+});

@@ -526,6 +526,27 @@ function copyLink(){
   if(navigator.clipboard) navigator.clipboard.writeText(link).then(done,()=>{});
 }
 
+function finalStandings(players){
+  const sorted = [...players].sort((a,b)=>b.score-a.score);
+  let place = 0;
+  return sorted.map((player,i)=>{
+    if(i===0 || player.score!==sorted[i-1].score) place=i+1;
+    return {...player, place};
+  });
+}
+function scorecardText(standings,total){
+  const rows = standings.map(p=>p.place+". "+p.name.replace(/\s+/g," ").trim()+" — "+p.score+" pts");
+  return ["Ballpark final standings", total+" rounds", "", ...rows, ""].join("\n");
+}
+function downloadScorecard(standings,total){
+  const blob = new Blob([scorecardText(standings,total)], {type:"text/plain;charset=utf-8"});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href=url; link.download="ballpark-standings.txt";
+  document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+
 /* ---------------- rendering ---------------- */
 const RULES = `<ol class="rules">
   <li><span>One player hosts and gets a 4-letter room code. Everyone else joins with that code on their own phone or computer.</span></li>
@@ -650,7 +671,7 @@ function render(){
     return;
   }
   if(s.phase==="final"){
-    const ranked=[...s.players].sort((a,b)=>b.score-a.score);
+    const ranked=finalStandings(s.players);
     const top=ranked[0].score, winners=ranked.filter(p=>p.score===top);
     app.innerHTML = `${head}
     <section class="panel podium">
@@ -659,9 +680,11 @@ function render(){
       <div class="num lit">${winners.map(w=>esc(w.name)).join(" & ")}</div>
       <p class="note">${esc(top)} points over ${esc(s.total)} rounds</p>
     </section>
-    <section class="panel"><h2>Standings</h2>${`<ul class="players">${ranked.map((p,i)=>`<li><span class="name">${i+1}. ${esc(p.name)}${p.id===ME?'<span class="you">YOU</span>':''}</span><span class="score">${esc(p.score)}</span></li>`).join("")}</ul>`}
+    <section class="panel"><h2>Standings</h2>${`<ul class="players">${ranked.map(p=>`<li><span class="name">${p.place}. ${esc(p.name)}${p.id===ME?'<span class="you">YOU</span>':''}</span><span class="score">${esc(p.score)}</span></li>`).join("")}</ul>`}
+      <button id="saveStandings" class="ghost">Download standings</button>
       ${isHost?'<button id="againBtn">Play again</button>':'<div class="waiting"><span class="dot"></span>The host can start a rematch.</div>'}
     </section>`;
+    $("#saveStandings").onclick=()=>downloadScorecard(ranked,s.total);
     if(isHost) $("#againBtn").onclick=()=>Host.begin();
   }
 }
